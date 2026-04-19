@@ -1,0 +1,46 @@
+# Stage 1: Build
+# Go compila un binario estático- sin dependencias externas
+FROM golang:1.22-alpine AS builder
+
+RUN adduser \    
+    --disabled-password \    
+    --gecos "" \    
+    --home "/nonexistent" \    
+    --shell "/sbin/nologin" \    
+    --no-create-home \    
+    --uid "10001" \    
+    scratchuser
+ 
+WORKDIR /app
+COPY main.go .
+ 
+# CGO_ENABLED=0 binario 100% estático, no necesita libc del OS
+# -ldflags "-s -w" elimina debug symbols (más pequeñ
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build \
+    -ldflags="-s -w" \
+    -o vulnerable-app \
+    main.go
+ 
+# Verificar que es estático (no debe mostrar dependencias)
+RUN ldd vulnerable-app || echo "[OK] Binario estáticosin deps"
+RUN ls -lh vulnerable-app
+ 
+# Stage 2: FROM scratch
+# La imagen final tiene SOLO el binario
+# Sin: bash, sh, ls, cat, curl, wget, apt, pip, nc, etc.
+FROM scratch
+ 
+# Copiar solo el binario compilado
+COPY --from=builder /app/vulnerable-app /vulnerable-app
+ 
+# Sin USER corre como root (uid 0)
+COPY --from=0 /etc/passwd /etc/passwd
+USER scratchuser
+
+# Sin SHELL no hay shell disponible
+# Sin nada má filesystem completamente vacío
+ 
+EXPOSE 8080
+ 
+ENTRYPOINT ["/vulnerable-app"]
