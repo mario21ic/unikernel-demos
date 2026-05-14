@@ -49,4 +49,12 @@ Ejecuta un unikernel de Nanos:
 ops pkg load eyberg/python3.10.6
 ```
 
+Ejecutar Unikernel de Webserver go con Firecrack
+```
+./ops-build.sh
+./start-firecracker.sh
+./test.sh
+./stop-nanos.sh
+```
+
 More examples https://github.com/nanovms/ops-examples/
