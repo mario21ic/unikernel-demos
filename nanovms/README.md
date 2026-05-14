@@ -58,3 +58,6 @@ Ejecutar Unikernel de Webserver go con Firecrack
 ```
 
 More examples https://github.com/nanovms/ops-examples/
+More info https://nanos.org/getting_started
+
+Book https://nanos.org/thebook
