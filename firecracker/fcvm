@@ -1,0 +1,501 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════
+# fcvm — CLI de administración para microVMs Firecracker
+# ══════════════════════════════════════════════════════
+# Uso: fcvm <comando> [args]
+# Instalar: sudo cp fcvm /usr/local/bin/fcvm && sudo chmod +x /usr/local/bin/fcvm
+
+set -euo pipefail
+
+# ─── Config global ────────────────────────────────────
+FCVM_DIR="${FCVM_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+VMS_DIR="${FCVM_DIR}/vms"
+FC_BIN="${FCVM_DIR}/fc-ex/firecracker"
+SSH_KEY="${FCVM_DIR}/$(ls ${FCVM_DIR}/*.id_rsa 2>/dev/null | head -1 | xargs basename 2>/dev/null || echo 'id_rsa')"
+SOCKET_PREFIX="/tmp/firecracker"
+
+# Colores
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ─── Helpers ──────────────────────────────────────────
+
+die()    { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
+info()   { echo -e "${CYAN}==>${NC} $*"; }
+ok()     { echo -e "${GREEN}✓${NC} $*"; }
+warn()   { echo -e "${YELLOW}⚠${NC}  $*"; }
+
+require_vm() {
+    local vm="$1"
+    [[ -z "$vm" ]] && die "Debes especificar un nombre de VM"
+    [[ ! -d "${VMS_DIR}/${vm}" ]] && die "VM '${vm}' no encontrada en ${VMS_DIR}"
+}
+
+vm_index() {
+    echo "$1" | grep -oE '[0-9]+$'
+}
+
+vm_ip() {
+    local idx=$(vm_index "$1")
+    echo "172.16.${idx}.2"
+}
+
+vm_tap() {
+    local idx=$(vm_index "$1")
+    echo "tap${idx}"
+}
+
+vm_socket() {
+    echo "${SOCKET_PREFIX}-$1.socket"
+}
+
+vm_pid() {
+    local socket=$(vm_socket "$1")
+    pgrep -f "api-sock ${socket}" 2>/dev/null || true
+}
+
+vm_running() {
+    local pid=$(vm_pid "$1")
+    [[ -n "$pid" ]] && return 0 || return 1
+}
+
+vm_api() {
+    # vm_api <vm> <METHOD> <endpoint> [data]
+    local vm="$1" method="$2" endpoint="$3" data="${4:-}"
+    local socket=$(vm_socket "$vm")
+    [[ ! -S "$socket" ]] && die "Socket no encontrado: $socket (¿está corriendo ${vm}?)"
+    if [[ -n "$data" ]]; then
+        sudo curl -sf -X "$method" --unix-socket "$socket" \
+            -H "Content-Type: application/json" \
+            --data "$data" "http://localhost${endpoint}"
+    else
+        sudo curl -sf -X "$method" --unix-socket "$socket" \
+            "http://localhost${endpoint}"
+    fi
+}
+
+ssh_vm() {
+    local vm="$1"; shift
+    local ip=$(vm_ip "$vm")
+    ssh -i "$SSH_KEY" \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=5 \
+        -o LogLevel=ERROR \
+        "root@${ip}" "$@"
+}
+
+ssh_available() {
+    ssh_vm "$1" true 2>/dev/null
+}
+
+# ─── Comandos ─────────────────────────────────────────
+
+cmd_list() {
+    echo ""
+    printf "${BOLD}%-15s %-8s %-14s %-14s %-8s %-6s %-6s${NC}\n" \
+        "VM" "STATUS" "IP" "TAP" "PID" "vCPU" "RAM"
+    echo "────────────────────────────────────────────────────────────────────────"
+
+    local found=0
+    for vm_dir in "${VMS_DIR}"/*/; do
+        [[ ! -d "$vm_dir" ]] && continue
+        local vm=$(basename "$vm_dir")
+        local idx=$(vm_index "$vm")
+        local ip=$(vm_ip "$vm")
+        local tap=$(vm_tap "$vm")
+        local pid=$(vm_pid "$vm")
+        local vcpu="-" mem="-" status_str status_color
+
+        if [[ -n "$pid" ]]; then
+            status_str="RUNNING"
+            status_color="${GREEN}"
+            # Leer config
+            if [[ -f "${vm_dir}/vm-config.json" ]]; then
+                vcpu=$(jq -r '.["machine-config"].vcpu_count // "-"' "${vm_dir}/vm-config.json" 2>/dev/null)
+                mem=$(jq -r '.["machine-config"].mem_size_mib // "-"' "${vm_dir}/vm-config.json" 2>/dev/null)
+                [[ "$mem" != "-" ]] && mem="${mem}M"
+            fi
+        else
+            status_str="STOPPED"
+            status_color="${DIM}"
+        fi
+
+        printf "${status_color}%-15s %-8s${NC} %-14s %-14s %-8s %-6s %-6s\n" \
+            "$vm" "$status_str" "$ip" "$tap" "${pid:--}" "$vcpu" "$mem"
+        found=1
+    done
+
+    [[ $found -eq 0 ]] && echo -e "${DIM}  No hay VMs registradas en ${VMS_DIR}${NC}"
+    echo ""
+}
+
+cmd_status() {
+    local vm="${1:-}"
+    require_vm "$vm"
+
+    local ip=$(vm_ip "$vm")
+    local tap=$(vm_tap "$vm")
+    local socket=$(vm_socket "$vm")
+    local pid=$(vm_pid "$vm")
+    local vm_dir="${VMS_DIR}/${vm}"
+
+    echo ""
+    echo -e "${BOLD}══ ${vm} ══${NC}"
+
+    if [[ -n "$pid" ]]; then
+        echo -e "  Estado   : ${GREEN}RUNNING${NC} (PID ${pid})"
+    else
+        echo -e "  Estado   : ${RED}STOPPED${NC}"
+    fi
+
+    echo -e "  IP       : ${ip}"
+    echo -e "  TAP      : ${tap}"
+    echo -e "  Socket   : ${socket}"
+    echo -e "  Dir      : ${vm_dir}"
+
+    if [[ -f "${vm_dir}/vm-config.json" ]]; then
+        local vcpu mem
+        vcpu=$(jq -r '.["machine-config"].vcpu_count' "${vm_dir}/vm-config.json" 2>/dev/null)
+        mem=$(jq -r '.["machine-config"].mem_size_mib' "${vm_dir}/vm-config.json" 2>/dev/null)
+        echo -e "  vCPUs    : ${vcpu}"
+        echo -e "  RAM      : ${mem} MiB"
+    fi
+
+    if [[ -n "$pid" ]]; then
+        echo ""
+        echo -e "  ${BOLD}Machine config (API):${NC}"
+        vm_api "$vm" GET /machine-config 2>/dev/null | jq -r \
+            '"    vcpu_count: \(.vcpu_count)  mem_size_mib: \(.mem_size_mib)  smt: \(.smt)"' \
+            2>/dev/null || true
+
+        echo ""
+        echo -e "  ${BOLD}SSH:${NC}"
+        if ssh_available "$vm"; then
+            echo -e "    ${GREEN}accesible${NC} → ssh -i ${SSH_KEY} root@${ip}"
+        else
+            echo -e "    ${YELLOW}no disponible aún${NC}"
+        fi
+
+        echo ""
+        echo -e "  ${BOLD}Uptime del proceso:${NC}"
+        ps -p "$pid" -o etime= 2>/dev/null | awk '{print "    "$1}' || true
+    fi
+
+    echo ""
+}
+
+cmd_console() {
+    local vm="${1:-}"
+    require_vm "$vm"
+    vm_running "$vm" || die "'${vm}' no está corriendo"
+    info "Adjuntando a consola de ${vm}  (Ctrl+A D para salir)"
+    sudo screen -r "$vm"
+}
+
+cmd_exec() {
+    # Envía comando a la consola serie vía screen stuff
+    local vm="${1:-}"; shift
+    require_vm "$vm"
+    vm_running "$vm" || die "'${vm}' no está corriendo"
+    [[ $# -eq 0 ]] && die "Debes pasar un comando. Ej: fcvm exec ${vm} 'uptime'"
+    local cmd="$*"
+    info "Ejecutando en consola de ${vm}: ${cmd}"
+    sudo screen -S "$vm" -p 0 -X stuff "${cmd}\n"
+}
+
+cmd_ssh() {
+    # SSH interactivo o con comando
+    local vm="${1:-}"; shift
+    require_vm "$vm"
+    vm_running "$vm" || die "'${vm}' no está corriendo"
+    local ip=$(vm_ip "$vm")
+    info "SSH → root@${ip}"
+    ssh_vm "$vm" "$@"
+}
+
+cmd_run() {
+    # Ejecuta comando via SSH y muestra output
+    local vm="${1:-}"; shift
+    require_vm "$vm"
+    vm_running "$vm" || die "'${vm}' no está corriendo"
+    [[ $# -eq 0 ]] && die "Debes pasar un comando. Ej: fcvm run ${vm} uptime"
+    local cmd="$*"
+    info "${vm} → ${cmd}"
+    ssh_vm "$vm" "$cmd"
+}
+
+cmd_runall() {
+    # Ejecuta un comando en todas las VMs corriendo
+    [[ $# -eq 0 ]] && die "Debes pasar un comando. Ej: fcvm runall uptime"
+    local cmd="$*"
+    for vm_dir in "${VMS_DIR}"/*/; do
+        local vm=$(basename "$vm_dir")
+        vm_running "$vm" || continue
+        printf "${CYAN}[%s]${NC} " "$vm"
+        ssh_vm "$vm" "$cmd" 2>/dev/null || echo "(falló)"
+    done
+}
+
+cmd_stop() {
+    local vm="${1:-}"
+    require_vm "$vm"
+    vm_running "$vm" || { warn "'${vm}' ya está detenida"; return; }
+
+    local pid=$(vm_pid "$vm")
+    info "Deteniendo ${vm} (PID ${pid})..."
+
+    # Intentar apagado limpio via API
+    vm_api "$vm" PUT /actions '{"action_type":"SendCtrlAltDel"}' 2>/dev/null || true
+    sleep 2s
+
+    # Si sigue vivo, SIGTERM
+    if vm_running "$vm"; then
+        sudo kill -SIGTERM "$pid" 2>/dev/null || true
+        sleep 2s
+    fi
+
+    # Si aún vivo, SIGKILL
+    if vm_running "$vm"; then
+        warn "Proceso persistente, forzando SIGKILL..."
+        sudo kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    # Limpiar tap y socket
+    local tap=$(vm_tap "$vm")
+    local socket=$(vm_socket "$vm")
+    sudo ip link del "$tap" 2>/dev/null || true
+    sudo rm -f "$socket"
+    screen -S "$vm" -X quit 2>/dev/null || true
+
+    ok "${vm} detenida"
+}
+
+cmd_kill() {
+    local vm="${1:-}"
+    require_vm "$vm"
+    local pid=$(vm_pid "$vm")
+    [[ -z "$pid" ]] && { warn "'${vm}' no está corriendo"; return; }
+
+    warn "Matando ${vm} (PID ${pid}) con SIGKILL..."
+    sudo kill -9 "$pid" 2>/dev/null || true
+
+    local tap=$(vm_tap "$vm")
+    local socket=$(vm_socket "$vm")
+    sudo ip link del "$tap" 2>/dev/null || true
+    sudo rm -f "$socket"
+    screen -S "$vm" -X quit 2>/dev/null || true
+
+    ok "${vm} eliminada"
+}
+
+cmd_stopall() {
+    info "Deteniendo todas las VMs..."
+    local count=0
+    for vm_dir in "${VMS_DIR}"/*/; do
+        local vm=$(basename "$vm_dir")
+        vm_running "$vm" || continue
+        cmd_stop "$vm"
+        count=$((count + 1))
+    done
+    [[ $count -eq 0 ]] && warn "No había VMs corriendo" || ok "${count} VM(s) detenidas"
+}
+
+cmd_logs() {
+    local vm="${1:-}"
+    local lines="${2:-50}"
+    require_vm "$vm"
+    local logfile="${VMS_DIR}/${vm}/${vm}.log"
+    # También intentar en FCVM_DIR
+    [[ ! -f "$logfile" ]] && logfile="${FCVM_DIR}/${vm}.log"
+    [[ ! -f "$logfile" ]] && die "Log no encontrado para ${vm}"
+    info "Log de ${vm} (últimas ${lines} líneas):"
+    tail -n "$lines" "$logfile"
+}
+
+cmd_follow() {
+    local vm="${1:-}"
+    require_vm "$vm"
+    local logfile="${VMS_DIR}/${vm}/${vm}.log"
+    [[ ! -f "$logfile" ]] && logfile="${FCVM_DIR}/${vm}.log"
+    [[ ! -f "$logfile" ]] && die "Log no encontrado para ${vm}"
+    info "Siguiendo log de ${vm} (Ctrl+C para salir):"
+    tail -f "$logfile"
+}
+
+cmd_api() {
+    # Llamada directa a la API REST de Firecracker
+    # Uso: fcvm api <vm> <GET|PUT|PATCH> <endpoint> [json-data]
+    local vm="${1:-}" method="${2:-GET}" endpoint="${3:-/}" data="${4:-}"
+    require_vm "$vm"
+    vm_running "$vm" || die "'${vm}' no está corriendo"
+    vm_api "$vm" "$method" "$endpoint" "$data" | jq . 2>/dev/null || true
+}
+
+cmd_snapshot() {
+    local vm="${1:-}"
+    require_vm "$vm"
+    vm_running "$vm" || die "'${vm}' no está corriendo"
+
+    local vm_dir="${VMS_DIR}/${vm}"
+    local snap_dir="${vm_dir}/snapshots/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$snap_dir"
+
+    info "Pausando ${vm}..."
+    vm_api "$vm" PATCH /vm '{"state":"Paused"}' > /dev/null
+
+    info "Tomando snapshot en ${snap_dir}..."
+    vm_api "$vm" PUT /snapshot/create \
+        "{\"snapshot_type\":\"Full\",\"snapshot_path\":\"${snap_dir}/snap.file\",\"mem_file_path\":\"${snap_dir}/snap.mem\"}" \
+        > /dev/null
+
+    info "Reanudando ${vm}..."
+    vm_api "$vm" PATCH /vm '{"state":"Resumed"}' > /dev/null
+
+    ok "Snapshot guardado en: ${snap_dir}"
+}
+
+cmd_pause() {
+    local vm="${1:-}"
+    require_vm "$vm"
+    vm_running "$vm" || die "'${vm}' no está corriendo"
+    info "Pausando ${vm}..."
+    vm_api "$vm" PATCH /vm '{"state":"Paused"}' > /dev/null
+    ok "${vm} pausada"
+}
+
+cmd_resume() {
+    local vm="${1:-}"
+    require_vm "$vm"
+    vm_running "$vm" || die "'${vm}' no está corriendo"
+    info "Reanudando ${vm}..."
+    vm_api "$vm" PATCH /vm '{"state":"Resumed"}' > /dev/null
+    ok "${vm} reanudada"
+}
+
+cmd_balloon() {
+    # Ajusta el balloon (memoria reclamada del guest)
+    local vm="${1:-}" mib="${2:-}"
+    require_vm "$vm"
+    vm_running "$vm" || die "'${vm}' no está corriendo"
+    [[ -z "$mib" ]] && die "Uso: fcvm balloon <vm> <mib>"
+    info "Ajustando balloon de ${vm} a ${mib} MiB..."
+    vm_api "$vm" PATCH /balloon "{\"amount_mib\":${mib}}" > /dev/null
+    ok "Balloon ajustado"
+}
+
+cmd_ip() {
+    local vm="${1:-}"
+    require_vm "$vm"
+    vm_ip "$vm"
+}
+
+cmd_ssh_copy_id() {
+    local vm="${1:-}"
+    require_vm "$vm"
+    local ip=$(vm_ip "$vm")
+    info "Copiando SSH key a ${vm} (${ip})..."
+    ssh-copy-id -i "${SSH_KEY}.pub" -o StrictHostKeyChecking=no "root@${ip}"
+}
+
+cmd_top() {
+    # Muestra uso de recursos de todas las VMs vía procfs
+    echo ""
+    printf "${BOLD}%-15s %-8s %-10s %-12s %-10s${NC}\n" \
+        "VM" "PID" "CPU%" "RSS (MB)" "UPTIME"
+    echo "──────────────────────────────────────────────────────"
+    for vm_dir in "${VMS_DIR}"/*/; do
+        local vm=$(basename "$vm_dir")
+        local pid=$(vm_pid "$vm")
+        [[ -z "$pid" ]] && continue
+        local cpu rss uptime
+        cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')
+        rss=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{printf "%.0f", $1/1024}')
+        uptime=$(ps -p "$pid" -o etime= 2>/dev/null | tr -d ' ')
+        printf "%-15s %-8s %-10s %-12s %-10s\n" \
+            "$vm" "$pid" "${cpu}%" "${rss} MB" "$uptime"
+    done
+    echo ""
+}
+
+cmd_help() {
+    cat << EOF
+
+${BOLD}fcvm${NC} — Administrador de microVMs Firecracker
+
+${BOLD}GESTIÓN DE VMs${NC}
+  fcvm list                        Listar todas las VMs y su estado
+  fcvm status  <vm>                Estado detallado de una VM
+  fcvm top                         Uso de CPU/RAM de VMs activas
+  fcvm ip      <vm>                Mostrar IP de la VM
+
+${BOLD}CONTROL${NC}
+  fcvm stop    <vm>                Apagado graceful (CtrlAltDel → SIGTERM → SIGKILL)
+  fcvm kill    <vm>                Forzar SIGKILL inmediato
+  fcvm stopall                     Detener todas las VMs
+  fcvm pause   <vm>                Pausar VM (congela vCPUs)
+  fcvm resume  <vm>                Reanudar VM pausada
+
+${BOLD}ACCESO${NC}
+  fcvm console <vm>                Adjuntar a consola serie (screen)
+  fcvm ssh     <vm> [cmd]          SSH interactivo o con comando
+  fcvm exec    <vm> <cmd>          Enviar comando a consola serie
+  fcvm run     <vm> <cmd>          Ejecutar comando via SSH (con output)
+  fcvm runall  <cmd>               Ejecutar comando en todas las VMs activas
+
+${BOLD}OBSERVABILIDAD${NC}
+  fcvm logs    <vm> [N]            Ver últimas N líneas del log (default: 50)
+  fcvm follow  <vm>                Seguir log en tiempo real
+
+${BOLD}SNAPSHOTS${NC}
+  fcvm snapshot <vm>               Tomar snapshot completo (pausa → snap → resume)
+
+${BOLD}API DIRECTA${NC}
+  fcvm api <vm> <METHOD> <endpoint> [json]
+                                   Llamada directa a la API REST de Firecracker
+  Ejemplos:
+    fcvm api microvm1 GET /machine-config
+    fcvm api microvm1 GET /drives/rootfs
+    fcvm api microvm1 PATCH /balloon '{"amount_mib":256}'
+
+${BOLD}MEMORIA DINÁMICA${NC}
+  fcvm balloon <vm> <mib>          Ajustar balloon (reclamar RAM del guest)
+
+${BOLD}VARIABLES DE ENTORNO${NC}
+  FCVM_DIR     Directorio raíz (default: directorio del script)
+
+EOF
+}
+
+# ─── Dispatcher ───────────────────────────────────────
+CMD="${1:-help}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+    list|ls)        cmd_list "$@" ;;
+    status|info)    cmd_status "$@" ;;
+    console|attach) cmd_console "$@" ;;
+    exec)           cmd_exec "$@" ;;
+    ssh)            cmd_ssh "$@" ;;
+    run)            cmd_run "$@" ;;
+    runall)         cmd_runall "$@" ;;
+    stop)           cmd_stop "$@" ;;
+    kill)           cmd_kill "$@" ;;
+    stopall)        cmd_stopall "$@" ;;
+    logs|log)       cmd_logs "$@" ;;
+    follow|tail)    cmd_follow "$@" ;;
+    snapshot|snap)  cmd_snapshot "$@" ;;
+    pause)          cmd_pause "$@" ;;
+    resume)         cmd_resume "$@" ;;
+    api)            cmd_api "$@" ;;
+    balloon)        cmd_balloon "$@" ;;
+    top)            cmd_top "$@" ;;
+    ip)             cmd_ip "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *)              echo -e "${RED}Comando desconocido: ${CMD}${NC}"; cmd_help; exit 1 ;;
+esac
