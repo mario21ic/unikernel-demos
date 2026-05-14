@@ -1,6 +1,6 @@
 spec: v0.6
-name: helloworld-gcc15.2
+name: helloworld-gcc13.2
 runtime: base:latest
-rootfs: ./Dockerfile # fs
+#rootfs: ./Dockerfile # para usar Docker
+rootfs: ./rootfs # directorio no Dockerfile
 cmd: ["/helloworld"]
-
